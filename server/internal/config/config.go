@@ -2,6 +2,9 @@ package config
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,13 +88,14 @@ type Config struct {
 	// TODO remove with transactions version 3
 	AllowZeroFees bool
 
-	EsploraURL       string
-	NeutrinoPeer     string
-	BitcoindRpcUser  string
-	BitcoindRpcPass  string
-	BitcoindRpcHost  string
-	BitcoindZMQBlock string
-	BitcoindZMQTx    string
+	EsploraURL         string
+	NeutrinoPeer       string
+	BitcoindCookieFile string
+	BitcoindRpcUser    string
+	BitcoindRpcPass    string
+	BitcoindRpcHost    string
+	BitcoindZMQBlock   string
+	BitcoindZMQTx      string
 
 	UnlockerType     string
 	UnlockerFilePath string // file unlocker
@@ -129,6 +133,7 @@ var (
 	BoardingExitDelay   = "BOARDING_EXIT_DELAY"
 	EsploraURL          = "ESPLORA_URL"
 	NeutrinoPeer        = "NEUTRINO_PEER"
+	BitcoindCookieFile  = "BITCOIND_RPC_COOKIE_FILE"
 	// #nosec G101
 	BitcoindRpcUser = "BITCOIND_RPC_USER"
 	// #nosec G101
@@ -244,6 +249,7 @@ func LoadConfig() (*Config, error) {
 		BoardingExitDelay:         determineLocktimeType(viper.GetInt64(BoardingExitDelay)),
 		EsploraURL:                viper.GetString(EsploraURL),
 		NeutrinoPeer:              viper.GetString(NeutrinoPeer),
+		BitcoindCookieFile:        viper.GetString(BitcoindCookieFile),
 		BitcoindRpcUser:           viper.GetString(BitcoindRpcUser),
 		BitcoindRpcPass:           viper.GetString(BitcoindRpcPass),
 		BitcoindRpcHost:           viper.GetString(BitcoindRpcHost),
@@ -469,6 +475,53 @@ func (c *Config) repoManager() error {
 	return nil
 }
 
+func parseRpcAuth(rpcauth string) (string, string, error){
+	parts := strings.SplitN(rpcauth, ":", 2)
+	username := parts[0]
+	preimageWithSalt := parts[1]
+
+	psParts := strings.SplitN(preimageWithSalt, "$", 2)
+	if len(psParts) != 2 {
+		return "", "", fmt.Errorf("failed to rpcauth credentials: %s", "invalid format, expected username:preimage$salt")
+	}
+	preimage := psParts[0]
+	salt := psParts[1]
+
+	h := hmac.New(sha256.New, []byte(salt))
+	h.Write([]byte(preimage))
+	hash := h.Sum(nil)
+	password := hex.EncodeToString(hash)
+
+	return username, password, nil
+}
+
+func getCookie(path string) (string, string, error) {
+	cookie, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read cookie %s: %s", path, err)
+	}
+
+	line := strings.TrimSpace(string(cookie))
+
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("failed to parse cookie file %s: %s", path, "invalid format, expected username:password")
+	}
+
+	username := parts[0]
+	password := parts[1]
+
+	if username == "" {
+		return "", "", fmt.Errorf("failed to parse cookie file %s: %s", path, "username cannot be empty")
+	}
+
+	if password == "" {
+		return "", "", fmt.Errorf("failed to parse cookie file %s: %s", path, "password cannot be empty")
+	}
+	
+	return username, password, nil
+}
+
 func (c *Config) walletService() error {
 	// Check if both Neutrino peer and Bitcoind RPC credentials are provided
 	if c.NeutrinoPeer != "" && (c.BitcoindRpcUser != "" || c.BitcoindRpcPass != "") {
@@ -489,6 +542,15 @@ func (c *Config) walletService() error {
 			Datadir: c.DbDir,
 			Network: c.Network,
 		}, btcwallet.WithPollingBitcoind(c.BitcoindRpcHost, c.BitcoindRpcUser, c.BitcoindRpcPass))
+	case c.BitcoindCookieFile != "":
+		cookiePath := filepath.Join(c.Datadir, c.BitcoindCookieFile)
+		if BitcoindRpcUser, BitcoindRpcPass, err = getCookie(cookiePath); err != nil {
+			return err
+		}
+		svc, err = btcwallet.NewService(btcwallet.WalletConfig{
+			Datadir: c.DbDir,
+			Network: c.Network,
+		}, btcwallet.WithPollingBitcoind(c.BitcoindRpcHost, BitcoindRpcUser, BitcoindRpcPass))
 	default:
 		// Default to Neutrino for Bitcoin mainnet or when NeutrinoPeer is explicitly set
 		if len(c.EsploraURL) == 0 {
